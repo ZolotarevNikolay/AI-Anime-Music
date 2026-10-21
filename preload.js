@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('player', {
   animeThemes: (target) => ipcRenderer.invoke('anime:themes', target),
   relatedAnime: (malIds) => ipcRenderer.invoke('anime:related', malIds),
   animeByGenres: (genres) => ipcRenderer.invoke('anime:genres', genres),
+  exploreAnime: (options) => ipcRenderer.invoke('anime:explore', options),
 
   // Событие: поиск уточнён медленным источником (русские названия).
   onAnimeEnriched: (handler) => {

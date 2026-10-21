@@ -22,6 +22,7 @@ const {
   getPopularAnime,
   getAnimeRecommendations,
   getAnimeByGenres,
+  getAnimeExplore,
 } = require('./lib/anime');
 const { RemoteCache, remoteUrl, handleRemote, resolveRemote, extractToken } = require('./lib/remote');
 
@@ -365,6 +366,18 @@ ipcMain.handle('anime:related', async (event, malIds) => {
 ipcMain.handle('anime:genres', async (event, genres) => {
   try {
     const results = await getAnimeByGenres(genres);
+    return {
+      ok: true,
+      results: results.map((anime) => ({ ...anime, cover: proxyCover(anime.cover) })),
+    };
+  } catch (err) {
+    return { ok: false, error: err.message, results: [] };
+  }
+});
+
+ipcMain.handle('anime:explore', async (event, options) => {
+  try {
+    const results = await getAnimeExplore(options || {});
     return {
       ok: true,
       results: results.map((anime) => ({ ...anime, cover: proxyCover(anime.cover) })),

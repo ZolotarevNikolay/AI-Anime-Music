@@ -1,7 +1,7 @@
 {
   "name": "music-player",
   "productName": "AI Anime Music",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Плеер опенингов и эндингов аниме",
   "main": "main.js",
   "author": "Nikolay Zolotarev",
@@ -21,7 +21,10 @@
     "release": "electron-builder --win nsis --publish always",
     "test:anime-api": "electron tools/test-anime-api.js",
     "test:anime-ui": "node tools/test-anime-ui.js",
-    "test:wave-ui": "node tools/test-wave-ui.js"
+    "test:wave-ui": "node tools/test-wave-ui.js",
+    "test:wave-sim": "node tools/test-wave-sim.js",
+    "test:wave-start": "node tools/test-wave-start.js",
+    "test:wave-discover": "node tools/test-wave-discover.js"
   },
   "devDependencies": {
     "electron": "20.1.0",

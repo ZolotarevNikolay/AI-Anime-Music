@@ -4,7 +4,7 @@
    Плеер опенингов и эндингов — логика интерфейса
    ========================================================== */
 
-const api = window.player;
+let api = window.player;
 
 const audio = document.getElementById('audio');
 
@@ -78,6 +78,7 @@ const state = {
     active: false,
     loading: false,
     error: '',
+    catalogError: '',
     queue: [],
     index: -1,
     pool: [],
@@ -1066,9 +1067,18 @@ function searchYouTube(title) {
 
 const WAVE_HISTORY_LIMIT = 20;
 const WAVE_HISTORY_STORE_LIMIT = 500;
+const WAVE_COOLDOWN_LIMIT = 48;
+const WAVE_MAX_QUEUE = 80;
+const WAVE_TARGET_HISTORY_LIMIT = 800;
 const WAVE_UNKNOWN_ARTISTS = new Set(['неизвестный исполнитель', 'unknown artist', 'unknown']);
+const WAVE_WILDCARD_GENRES = [
+  'Action', 'Adventure', 'Comedy', 'Drama', 'Fantasy', 'Mystery', 'Romance',
+  'Sci-Fi', 'Slice of Life', 'Sports', 'Supernatural', 'Thriller', 'Mecha',
+  'Music', 'Psychological',
+];
 let waveFillPromise = null;
 let waveAdvancePromise = null;
+let waveThemesRetryAt = 0;
 
 function waveIsUnknownArtist(name) {
   const clean = String(name || '').trim().toLowerCase();
@@ -1088,10 +1098,7 @@ function waveTopKeys(map, count = 5) {
     .map(([key]) => key);
 }
 
-function waveTopGenres(count = 3) {
-  const fromProfile = waveTopKeys(state.waveProfile.genres, count);
-  if (fromProfile.length) return fromProfile;
-
+function waveFavoriteGenreCounts() {
   const counts = new Map();
   const addGenres = (genres) => {
     for (const genre of Array.isArray(genres) ? genres : []) {
@@ -1109,8 +1116,53 @@ function waveTopGenres(count = 3) {
     }
   }
   addGenres(state.anime.selected?.genres);
+  return counts;
+}
 
-  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, count).map(([key]) => key);
+/** Жанры из избранного — запасной положительный сигнал, если профиль ушёл в минус. */
+function waveFavoriteGenreMap() {
+  return Object.fromEntries(waveFavoriteGenreCounts());
+}
+
+function waveTopGenres(count = 3) {
+  const fromProfile = waveTopKeys(state.waveProfile.genres, count);
+  if (fromProfile.length >= count) return fromProfile;
+
+  const favorites = [...waveFavoriteGenreCounts().entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([key]) => key);
+
+  return [...new Set([...fromProfile, ...favorites])].slice(0, count);
+}
+
+function waveIsKnownTrack(track) {
+  if (!track) return false;
+  return isFavorite(track) || state.listenHistory.some((entry) => entry.trackId === track.id);
+}
+
+function waveCooldownIds() {
+  const ids = new Set();
+  for (const entry of state.wave.history.slice(0, WAVE_COOLDOWN_LIMIT)) {
+    if (entry.trackId) ids.add(entry.trackId);
+  }
+  for (const entry of state.listenHistory.slice(0, WAVE_COOLDOWN_LIMIT)) {
+    if (entry.trackId) ids.add(entry.trackId);
+  }
+  return ids;
+}
+
+function waveRandomInt(min, max) {
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+/** Профильные жанры + случайный «дикий» жанр, чтобы не зациклиться. */
+function waveExploreGenres(count = 3) {
+  const result = [...waveTopGenres(count)];
+  const pool = WAVE_WILDCARD_GENRES.filter((genre) => !result.includes(genre));
+  while (result.length < count && pool.length) {
+    result.push(pool.splice(waveRandomInt(0, pool.length - 1), 1)[0]);
+  }
+  return result;
 }
 
 function waveEffectiveMood() {
@@ -1134,7 +1186,8 @@ function waveBump(map, key, delta) {
   const clean = String(key || '').trim();
   if (!clean) return;
   const current = waveMapValue(map, clean);
-  map[clean] = current * 0.985 + delta;
+  // Не позволяем одному жанру уйти в бесконечный минус из-за серии пропусков.
+  map[clean] = Math.max(-20, Math.min(20, current * 0.985 + delta));
   if (Math.abs(map[clean]) < 0.01) delete map[clean];
 }
 
@@ -1234,14 +1287,38 @@ function waveLocalTracks(seedAnime, seedTrack = null) {
 
 async function waveDiscoverTargets(seedAnime) {
   const seedIds = waveSeedMalIds(seedAnime).slice(0, 5);
-  const genres = waveTopGenres(3);
-  const [relatedResult, genreResult] = await Promise.all([
+  const genres = waveExploreGenres(3);
+  const wildcardPool = WAVE_WILDCARD_GENRES.filter((genre) => !genres.includes(genre));
+  const wildcard = wildcardPool.length
+    ? wildcardPool[waveRandomInt(0, wildcardPool.length - 1)]
+    : null;
+  const exploreGenres = wildcard ? [...genres.slice(0, 2), wildcard] : genres;
+  const currentYear = new Date().getFullYear();
+
+  // Два независимых среза каталога: профильный и с «диким» жанром.
+  // Случайная страница/год не даёт волне застрять на первых популярных тайтлах.
+  const exploreOptions = [
+    {
+      genres,
+      page: waveRandomInt(1, 35),
+      year: Math.random() < 0.35 ? waveRandomInt(1995, currentYear) : null,
+    },
+    {
+      genres: exploreGenres,
+      page: waveRandomInt(1, 25),
+      year: Math.random() < 0.5 ? waveRandomInt(1995, currentYear) : null,
+    },
+  ];
+
+  const [relatedResult, ...exploreResults] = await Promise.all([
     seedIds.length
       ? api.relatedAnime(seedIds).catch(() => ({ related: [] }))
       : Promise.resolve({ related: [] }),
-    genres.length
-      ? api.animeByGenres(genres).catch(() => ({ results: [] }))
-      : Promise.resolve({ results: [] }),
+    ...exploreOptions.map((options) => (
+      typeof api.exploreAnime === 'function'
+        ? api.exploreAnime({ ...options, perPage: 30 }).catch(() => ({ results: [] }))
+        : Promise.resolve({ results: [] })
+    )),
   ]);
 
   const used = new Set(state.wave.targets);
@@ -1252,62 +1329,148 @@ async function waveDiscoverTargets(seedAnime) {
     const rating = Number(target.rating) || 0;
     if (!current) {
       byMal.set(target.malId, { ...target, rating, _waveSource: source });
-    } else if (rating > current.rating) {
-      byMal.set(target.malId, { ...current, ...target, rating, _waveSource: source });
+    } else {
+      const bestRating = Math.max(current.rating || 0, rating);
+      byMal.set(target.malId, {
+        ...current,
+        ...target,
+        rating: bestRating,
+        _waveSource: current._waveSource === 'related' ? 'related' : source,
+      });
     }
   };
 
   for (const target of relatedResult?.related || []) add(target, 'related');
-  for (const target of genreResult?.results || []) add(target, 'genre');
+  for (const result of exploreResults) {
+    for (const target of result?.results || []) add(target, 'explore');
+  }
+
+  // Если explore не ответил, сохраняем старый резервный путь по жанрам.
+  if (!byMal.size && genres.length) {
+    const genreResult = await api.animeByGenres(genres).catch(() => ({ results: [] }));
+    for (const target of genreResult?.results || []) add(target, 'explore');
+  }
 
   const seedSet = new Set(seedIds);
-  let candidates = [...byMal.values()].filter((target) => !seedSet.has(target.malId));
+  const pool = [...byMal.values()].filter((target) => !seedSet.has(target.malId));
   const genreRank = new Map(genres.map((genre, index) => [genre, genres.length - index]));
   const rank = (target) => {
     const overlap = (target.genres || []).reduce((sum, genre) => sum + (genreRank.get(genre) || 0), 0);
     return overlap * 0.8 + (Number(target.rating) || 0) / 120 + (Number(target.score) || 0) / 250 + Math.random() * 0.2;
   };
-  candidates.sort((a, b) => rank(b) - rank(a));
 
-  let chosen = candidates.slice(0, 4);
-  if (!chosen.length) {
-    const popular = await api.popularAnime().catch(() => ({ results: [] }));
-    chosen = (popular.results || [])
-      .filter((target) => target?.malId && !used.has(target.malId))
-      .slice(0, 4)
-      .map((target) => ({ ...target, _waveSource: 'popular' }));
+  const related = pool
+    .filter((target) => target._waveSource === 'related')
+    .sort((a, b) => rank(b) - rank(a));
+  const explore = pool
+    .filter((target) => target._waveSource === 'explore')
+    .sort((a, b) => rank(b) - rank(a));
+  const chosen = [];
+  const chosenIds = new Set();
+  const take = (list, limit) => {
+    for (const target of list) {
+      if (chosen.length >= limit) break;
+      if (chosenIds.has(target.malId)) continue;
+      chosenIds.add(target.malId);
+      chosen.push(target);
+    }
+  };
+
+  // 8 тайтлов за пополнение: 3 по рекомендациям и 5 из большого каталога.
+  take(related, 3);
+  take(explore, 8);
+  if (chosen.length < 8) {
+    take(pool.slice().sort((a, b) => rank(b) - rank(a)), 8);
   }
+
   if (!chosen.length) {
-    // Каталог популярных уже израсходован — начинаем новый круг.
+    // Старый список целей мог полностью исчерпаться — начинаем новый круг.
     state.wave.targets = [];
     const popular = await api.popularAnime().catch(() => ({ results: [] }));
-    chosen = (popular.results || [])
-      .filter((target) => target?.malId)
-      .slice(0, 4)
-      .map((target) => ({ ...target, _waveSource: 'popular' }));
+    take(
+      (popular.results || [])
+        .filter((target) => target?.malId && !seedSet.has(target.malId))
+        .map((target) => ({ ...target, _waveSource: 'popular' })),
+      8
+    );
   }
 
+  if (!chosen.length) {
+    state.wave.catalogError = 'Каталог временно недоступен — не удалось найти новые аниме.';
+    return [];
+  }
+
+  state.wave.catalogError = '';
   state.wave.targets.push(...chosen.map((target) => target.malId).filter(Boolean));
+  if (state.wave.targets.length > WAVE_TARGET_HISTORY_LIMIT) {
+    // Держим историю целей, но не даём ей расти бесконечно.
+    state.wave.targets = state.wave.targets.slice(-Math.floor(WAVE_TARGET_HISTORY_LIMIT / 2));
+  }
   return chosen;
 }
 
+async function waveThemesForTarget(target) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const result = await api.animeThemes({
+        malId: target.malId,
+        title: target.title,
+        probeDurations: false,
+      });
+      if (result?.ok) return result;
+      lastError = new Error(result?.error || 'Каталог не ответил');
+    } catch (err) {
+      lastError = err;
+    }
+    if (attempt === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 700 + Math.random() * 500));
+    }
+  }
+  return { ok: false, error: lastError?.message || 'Каталог не ответил' };
+}
+
 async function waveFetchCandidates(seedAnime) {
+  if (Date.now() < waveThemesRetryAt) return [];
+
   const targets = await waveDiscoverTargets(seedAnime);
   if (!targets.length) return [];
 
-  const results = await Promise.allSettled(targets.map(async (target) => {
-    const result = await api.animeThemes({
-      malId: target.malId,
-      title: target.title,
-      probeDurations: false,
-    });
-    if (!result?.ok || !result.found) return [];
-    return (result.tracks || [])
-      .map((track) => waveDecorateTrack(track, target))
-      .filter(Boolean);
-  }));
+  const found = [];
+  let failed = 0;
+  let cursor = 0;
 
-  return results.flatMap((result) => result.status === 'fulfilled' ? result.value : []);
+  // Не больше двух одновременных запросов: AnimeThemes болезненно
+  // относится к пачкам и начинает отвечать 403/429.
+  const worker = async () => {
+    while (cursor < targets.length) {
+      const target = targets[cursor++];
+      const result = await waveThemesForTarget(target);
+      if (result.ok && result.found) {
+        for (const track of result.tracks || []) {
+          const decorated = waveDecorateTrack(track, target);
+          if (decorated) found.push(decorated);
+        }
+      } else if (!result.ok) {
+        failed += 1;
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(2, targets.length) }, () => worker())
+  );
+
+  if (failed && !found.length) {
+    waveThemesRetryAt = Date.now() + 30000;
+    state.wave.catalogError = 'Каталог опенингов временно недоступен. Пока играю знакомое.';
+  } else if (failed) {
+    state.wave.catalogError = 'Часть каталога временно недоступна — доберу позже.';
+  } else if (found.length) {
+    state.wave.catalogError = '';
+  }
+
+  return found;
 }
 
 function waveMergePool(tracks) {
@@ -1323,8 +1486,42 @@ function waveMergePool(tracks) {
   }
 }
 
+function waveGenreAffinity(genres) {
+  const list = Array.isArray(genres) ? genres : [];
+  if (!list.length) return { score: 0, penalty: 0 };
+
+  const profile = state.waveProfile.genres;
+  const favorites = waveFavoriteGenreMap();
+  const hasPositiveProfile = Object.values(profile).some((value) => Number(value) > 0);
+  let positive = 0;
+  let penalty = 0;
+
+  for (const genre of list) {
+    const profileValue = waveProfileValue(profile, genre);
+    const favoriteValue = waveProfileValue(favorites, genre);
+    // Если профиль полностью ушёл в минус, не штрафуем новые треки:
+    // иначе волна снова замыкается на знакомом.
+    positive += (hasPositiveProfile ? Math.max(0, profileValue) * 0.65 : 0)
+      + Math.max(0, favoriteValue) * 0.35;
+    if (hasPositiveProfile) penalty += Math.max(0, -profileValue);
+  }
+
+  return {
+    score: positive / list.length,
+    penalty: penalty / list.length,
+  };
+}
+
+function waveGenreReasonValue(genre) {
+  const profileValue = Math.max(0, waveProfileValue(state.waveProfile.genres, genre));
+  const favoriteValue = Math.max(0, waveProfileValue(waveFavoriteGenreMap(), genre));
+  return Math.max(profileValue, favoriteValue * 0.9);
+}
+
 function waveReasonFor(track) {
   if (isFavorite(track)) return 'Из вашего избранного';
+  if (waveIsKnownTrack(track)) return 'Уже слушали — освежаем';
+
   const artist = waveProfileValue(state.waveProfile.artists, track.artist);
   if (artist > 0.35 && track.artist && !waveIsUnknownArtist(track.artist)) {
     const name = track.artist.split(',')[0].replace(/\s+как\s+.+$/i, '').trim();
@@ -1333,13 +1530,14 @@ function waveReasonFor(track) {
 
   const genres = Array.isArray(track.animeGenres) ? track.animeGenres : [];
   const genre = genres
-    .map((name) => ({ name, value: waveProfileValue(state.waveProfile.genres, name) }))
+    .map((name) => ({ name, value: waveGenreReasonValue(name) }))
     .sort((a, b) => b.value - a.value)[0];
   if (genre && genre.value > 0.25) return `Любимый жанр: ${genre.name}`;
 
   if (track._waveSource === 'related' && track._waveFromTitle) {
     return `Похоже на «${track._waveFromTitle}»`;
   }
+  if (track._waveSource === 'explore') return 'Новое для вас';
   if (track._waveSource === 'popular') return 'Популярное аниме';
   if ((state.waveProfile.events || 0) < 3) return 'Новое для вас';
   return 'Открытие для вас';
@@ -1348,9 +1546,7 @@ function waveReasonFor(track) {
 function waveScoreTrack(track) {
   const profile = state.waveProfile;
   const genres = Array.isArray(track.animeGenres) ? track.animeGenres : [];
-  const genreScore = genres.length
-    ? genres.reduce((sum, genre) => sum + waveProfileValue(profile.genres, genre), 0) / genres.length
-    : 0;
+  const affinity = waveGenreAffinity(genres);
   const artistScore = waveIsUnknownArtist(track.artist)
     ? 0
     : waveProfileValue(profile.artists, track.artist);
@@ -1361,11 +1557,12 @@ function waveScoreTrack(track) {
   const eraScore = waveProfileValue(profile.eras, eraKey);
   const typeScore = waveProfileValue(profile.types, track.themeType);
   const quality = Number.isFinite(track.animeScore) ? (track.animeScore - 75) / 50 : 0;
-  const known = isFavorite(track) || state.listenHistory.some((entry) => entry.trackId === track.id);
+  const known = waveIsKnownTrack(track);
   const novelty = state.waveSettings.novelty;
   const mood = waveEffectiveMood();
 
-  let score = genreScore * 2.1
+  let score = affinity.score * 2.1
+    - affinity.penalty * 0.9
     + artistScore * 0.85
     + animeScore * 0.55
     + eraScore * 0.22
@@ -1388,48 +1585,87 @@ function waveScoreTrack(track) {
   return score;
 }
 
-function wavePickTracks(count, pool = state.wave.pool) {
-  const queued = new Set(state.wave.queue.map((track) => track.id));
-  const candidates = pool.filter((track) => (
+function wavePickOne(candidates, picked) {
+  if (!candidates.length) return null;
+
+  const recent = [...state.wave.queue.slice(-4), ...picked];
+  const scored = candidates.map((track) => {
+    const sameAnime = recent.filter((item) => item.animeTitle === track.animeTitle).length;
+    const sameArtist = recent.filter((item) => item.artist === track.artist).length;
+    let score = waveScoreTrack(track) + Math.random() * 0.9;
+    score -= sameAnime * 0.85;
+    if (recent[0]?.animeTitle === track.animeTitle) score -= 0.9;
+    score -= sameArtist * 0.45;
+    return { track, score };
+  }).sort((a, b) => b.score - a.score);
+
+  const top = scored.slice(0, Math.min(12, scored.length));
+  const floor = top[top.length - 1].score;
+  const weights = top.map((item) => Math.exp((item.score - floor) * 1.5));
+  const total = weights.reduce((sum, weight) => sum + weight, 0);
+  let roll = Math.random() * total;
+  let choice = top[0];
+  for (let i = 0; i < top.length; i += 1) {
+    roll -= weights[i];
+    if (roll <= 0) {
+      choice = top[i];
+      break;
+    }
+  }
+  return choice.track;
+}
+
+function wavePickTracks(count, pool = state.wave.pool, options = {}) {
+  const currentId = state.wave.queue[state.wave.index]?.id || null;
+  const upcoming = new Set(
+    state.wave.queue.slice(state.wave.index + 1).map((track) => track.id)
+  );
+  const cooldown = options.ignoreCooldown ? new Set() : waveCooldownIds();
+
+  const base = pool.filter((track) => (
     track?.streamUrl
     && track.id
-    && !queued.has(track.id)
+    && track.id !== currentId
+    && !upcoming.has(track.id)
     && !state.waveDislikes.includes(track.id)
     && !track.nsfw
   ));
+
+  // Сначала не берём то, что уже играло недавно. Если пул исчерпан,
+  // ослабляем cooldown, но никогда не повторяем текущий и следующие треки.
+  let candidates = base.filter((track) => !cooldown.has(track.id));
+  if (candidates.length < count) {
+    const present = new Set(candidates.map((track) => track.id));
+    candidates = candidates.concat(base.filter((track) => !present.has(track.id)));
+  }
+  if (!candidates.length) return [];
+
+  const novelty = options.familiarOnly ? 0 : state.waveSettings.novelty;
+  const targetNew = options.familiarOnly ? 0 : Math.round(count * novelty);
+  const known = candidates.filter((track) => waveIsKnownTrack(track));
+  const fresh = candidates.filter((track) => !waveIsKnownTrack(track));
+  const remaining = new Map(candidates.map((track) => [track.id, track]));
   const picked = [];
 
-  while (picked.length < count && candidates.length) {
-    const recent = [...state.wave.queue.slice(-4), ...picked];
-    const scored = candidates.map((track) => {
-      const sameAnime = recent.filter((item) => item.animeTitle === track.animeTitle).length;
-      const sameArtist = recent.filter((item) => item.artist === track.artist).length;
-      let score = waveScoreTrack(track) + Math.random() * 0.9;
-      score -= sameAnime * 0.85;
-      if (recent[0]?.animeTitle === track.animeTitle) score -= 0.9;
-      score -= sameArtist * 0.45;
-      return { track, score };
-    }).sort((a, b) => b.score - a.score);
-
-    const top = scored.slice(0, Math.min(12, scored.length));
-    const floor = top[top.length - 1].score;
-    const weights = top.map((item) => Math.exp((item.score - floor) * 1.5));
-    const total = weights.reduce((sum, weight) => sum + weight, 0);
-    let roll = Math.random() * total;
-    let choice = top[0];
-    for (let i = 0; i < top.length; i++) {
-      roll -= weights[i];
-      if (roll <= 0) {
-        choice = top[i];
-        break;
-      }
+  const take = (list, limit) => {
+    while (picked.length < limit) {
+      const available = list.filter((track) => remaining.has(track.id));
+      if (!available.length) break;
+      const choice = wavePickOne(available, picked);
+      if (!choice) break;
+      picked.push({
+        ...choice,
+        _waveReason: waveReasonFor(choice),
+        _waveKnown: waveIsKnownTrack(choice),
+      });
+      remaining.delete(choice.id);
     }
+  };
 
-    picked.push({ ...choice.track, _waveReason: waveReasonFor(choice.track) });
-    const index = candidates.findIndex((track) => track.id === choice.track.id);
-    if (index >= 0) candidates.splice(index, 1);
-  }
-
+  // Квоты: при 90% нового примерно 9 новых и 1 знакомый.
+  take(fresh, targetNew);
+  take(known, count);
+  take(candidates, count);
   return picked;
 }
 
@@ -1440,6 +1676,39 @@ function playWaveQueue(index) {
   state.queue = state.wave.queue;
   state.queueIndex = index;
   loadCurrent(true);
+}
+
+/** Убирает только уже сыгранные треки, не трогая текущий и следующие. */
+function trimWaveQueue() {
+  const overflow = state.wave.queue.length - WAVE_MAX_QUEUE;
+  if (overflow <= 0) return;
+  const removable = Math.max(0, Math.min(overflow, state.wave.index > 0 ? state.wave.index : 0));
+  if (!removable) return;
+  state.wave.queue.splice(0, removable);
+  state.wave.index -= removable;
+  if (state.queue === state.wave.queue) state.queueIndex = state.wave.index;
+}
+
+function waveHasNewCandidates() {
+  return state.wave.pool.some((track) => (
+    track?.streamUrl
+    && track.id
+    && !state.waveDislikes.includes(track.id)
+    && !track.nsfw
+    && !waveIsKnownTrack(track)
+  ));
+}
+
+/** Аварийный запас, если каталог недоступен: играем знакомое, но не молчим. */
+function waveFamiliarFallback(seedAnime, seedTrack, count = 8) {
+  const local = waveLocalTracks(seedAnime, seedTrack);
+  if (!local.length) return 0;
+  waveMergePool(local);
+  const picks = wavePickTracks(count, local, { familiarOnly: true, ignoreCooldown: true });
+  if (!picks.length) return 0;
+  state.wave.queue.push(...picks);
+  if (state.wave.active) state.queue = state.wave.queue;
+  return picks.length;
 }
 
 async function refillWave(options = {}) {
@@ -1460,31 +1729,54 @@ async function refillWave(options = {}) {
     try {
       if (generation !== state.wave.requestId) return 0;
 
-      if (options.force || state.wave.pool.length < 8) {
+      state.wave.catalogError = '';
+      const needCatalog = options.force
+        || state.wave.pool.length < 8
+        || !waveHasNewCandidates();
+
+      if (needCatalog) {
         const found = await waveFetchCandidates(options.seedAnime);
         if (generation !== state.wave.requestId) return 0;
         waveMergePool(found);
       }
 
-      let picks = wavePickTracks(options.force ? 10 : 6);
+      let picks = wavePickTracks(options.force ? 10 : 8);
+      if (!picks.length) {
+        // В пуле могло не остаться новых треков. Подмешиваем знакомые
+        // как страховку, но не подменяем ими весь поток.
+        const local = waveLocalTracks(options.seedAnime, options.seedTrack);
+        waveMergePool(local);
+        picks = wavePickTracks(options.force ? 10 : 8, undefined, {
+          familiarOnly: !waveHasNewCandidates(),
+        });
+      }
       if (!picks.length) {
         const found = await waveFetchCandidates(options.seedAnime);
         if (generation !== state.wave.requestId) return 0;
         waveMergePool(found);
-        picks = wavePickTracks(6);
+        picks = wavePickTracks(8);
       }
 
       if (generation !== state.wave.requestId) return 0;
       if (picks.length) {
         state.wave.queue.push(...picks);
+        trimWaveQueue();
         if (state.wave.active) state.queue = state.wave.queue;
         added = picks.length;
       }
-      state.wave.error = state.wave.queue.length ? '' : 'Не удалось собрать волну. Проверьте подключение к интернету.';
+      if (state.wave.queue.length) {
+        state.wave.error = '';
+      } else {
+        state.wave.error = state.wave.catalogError
+          || 'Не удалось собрать волну. Проверьте подключение к интернету.';
+      }
     } catch (err) {
       console.warn('Не удалось пополнить волну:', err);
-      if (generation === state.wave.requestId && !state.wave.queue.length) {
-        state.wave.error = 'Не удалось собрать волну. Проверьте подключение к интернету.';
+      if (generation === state.wave.requestId) {
+        state.wave.catalogError = 'Каталог временно недоступен. Пока играю знакомое.';
+        if (!state.wave.queue.length) {
+          state.wave.error = 'Не удалось собрать волну. Проверьте подключение к интернету.';
+        }
       }
     } finally {
       if (generation === state.wave.requestId) {
@@ -1510,9 +1802,11 @@ async function startWave(options = {}) {
   const requestId = ++state.wave.requestId;
   waveFillPromise = null;
   waveAdvancePromise = null;
+  waveThemesRetryAt = 0;
   state.wave.active = true;
   state.wave.loading = true;
   state.wave.error = '';
+  state.wave.catalogError = '';
   state.wave.queue = [];
   state.wave.index = -1;
   state.wave.pool = [];
@@ -1522,19 +1816,33 @@ async function startWave(options = {}) {
   renderSidebar();
   render();
 
-  // Знакомые треки доступны сразу — не заставляем ждать сеть.
+  // Знакомое больше не запускается пачкой. В пул оно попадает только
+  // как страховка, если каталог не ответит. Если пользователь пришёл
+  // из карточки аниме, его трек остаётся единственным якорем.
   const local = waveLocalTracks(seedAnime, seedTrack);
-  if (local.length) {
-    state.wave.pool = local;
-    const initial = wavePickTracks(Math.min(12, local.length));
-    if (initial.length) {
-      state.wave.queue = initial;
+  waveMergePool(local);
+
+  if (seedTrack) {
+    const anchor = local.find((track) => track.id === seedTrack.id);
+    if (anchor && !state.waveDislikes.includes(anchor.id)) {
+      state.wave.queue = [{
+        ...anchor,
+        _waveReason: 'Вы выбрали это аниме',
+        _waveKnown: true,
+      }];
       playWaveQueue(0);
     }
   }
 
-  await refillWave({ force: true, seedAnime });
+  await refillWave({ force: true, seedAnime, seedTrack });
   if (requestId !== state.wave.requestId || !state.wave.active) return;
+
+  if (!state.wave.queue.length) {
+    // Каталог мог не ответить. Не оставляем пользователя с пустым экраном:
+    // включаем знакомое и честно показываем, что нового пока нет.
+    waveFamiliarFallback(seedAnime, seedTrack, 8);
+    if (state.wave.queue.length && state.wave.index < 0) playWaveQueue(0);
+  }
 
   state.wave.loading = false;
   if (!state.wave.queue.length) {
@@ -1682,7 +1990,7 @@ function finalizeListen(completed) {
   }
 
   if (finished) waveBumpProfile(track, 1.2);
-  else if (skipped) waveBumpProfile(track, -0.5);
+  else if (skipped) waveBumpProfile(track, -0.35);
 
   persist();
   state.listenSession = null;
@@ -1751,8 +2059,8 @@ function renderWave() {
     intro.innerHTML = `
       <div class="wave-intro-art">≈</div>
       <div>
-        <h3>Волна начинает с популярного — дальше учится на вас</h3>
-        <p>Ставьте ♥, пропускайте и отмечайте «не нравиться». Волна запомнит жанры, исполнителей и аниме, которые вам ближе.</p>
+        <h3>Волна начинается с нового — и учится на ваших реакциях</h3>
+        <p>Она ищет опенинги и эндинги по всему каталогу, а не только среди избранного. Ставьте ♥, пропускайте и отмечайте «не нравится» — так волна поймёт, что оставить, а что убрать.</p>
         <button class="btn btn-primary" id="wave-start">Включить волну</button>
       </div>
     `;
@@ -1802,6 +2110,7 @@ function renderWave() {
   meta.className = 'wave-meta';
   const type = current.themeType ? `${current.themeType}${current.trackNumber != null ? current.trackNumber : ''}` : '';
   const facts = [current.animeTitle, type].filter(Boolean).join(' · ');
+  const known = current._waveKnown ?? waveIsKnownTrack(current);
   meta.innerHTML = `
     <div class="wave-eyebrow"><span class="wave-dot"></span> МОЯ ВОЛНА ${state.wave.loading ? '<span class="wave-pill">подбираем ещё…</span>' : ''}</div>
     <h2 class="wave-track-title">${escapeHtml(current.title)}</h2>
@@ -1809,6 +2118,7 @@ function renderWave() {
     <div class="wave-track-facts">${escapeHtml(facts)}</div>
     <div class="wave-reasons">
       <span class="wave-reason">${escapeHtml(current._waveReason || waveReasonFor(current))}</span>
+      <span class="wave-reason wave-reason-muted">${known ? 'знакомое' : 'новое'}</span>
       ${(state.waveProfile.events || 0) < 3 ? '<span class="wave-reason wave-reason-muted">волна учится</span>' : ''}
     </div>
     <div class="wave-actions">
@@ -1829,10 +2139,13 @@ function renderWave() {
   hero.appendChild(body);
   el.view.appendChild(hero);
 
-  if (state.wave.error && state.wave.queue.length) {
+  const waveNote = state.wave.queue.length
+    ? (state.wave.catalogError || state.wave.error)
+    : '';
+  if (waveNote) {
     const note = document.createElement('div');
     note.className = 'wave-note';
-    note.textContent = state.wave.error;
+    note.textContent = waveNote;
     el.view.appendChild(note);
   }
 
@@ -1892,7 +2205,11 @@ function renderWave() {
   } else {
     const loading = document.createElement('div');
     loading.className = 'wave-next-empty';
-    loading.textContent = state.wave.loading ? 'Подбираем следующие треки…' : 'Дальше пока пусто';
+    loading.textContent = state.wave.loading
+      ? 'Подбираем следующие треки…'
+      : state.wave.catalogError
+        ? 'Каталог пока недоступен — доберём позже'
+        : 'Дальше пока пусто';
     nextList.appendChild(loading);
   }
   upcoming.appendChild(nextList);
