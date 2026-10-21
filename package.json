@@ -1,0 +1,85 @@
+{
+  "name": "music-player",
+  "productName": "AI Anime Music",
+  "version": "1.0.0",
+  "description": "Плеер опенингов и эндингов аниме",
+  "main": "main.js",
+  "author": "Nikolay Zolotarev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZolotarevNikolay/AI-Anime-Music.git"
+  },
+  "homepage": "https://github.com/ZolotarevNikolay/AI-Anime-Music",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dev:debug": "electron . --dev --remote-debugging-port=9222",
+    "icons": "electron tools/make-icons.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis",
+    "release": "electron-builder --win nsis --publish always",
+    "test:anime-api": "electron tools/test-anime-api.js",
+    "test:anime-ui": "node tools/test-anime-ui.js",
+    "test:wave-ui": "node tools/test-wave-ui.js"
+  },
+  "devDependencies": {
+    "electron": "20.1.0",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "build": {
+    "appId": "com.zolotarevnikolay.aianimemusic",
+    "productName": "AI Anime Music",
+    "asar": true,
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer.js",
+      "index.html",
+      "style.css",
+      "icon.png",
+      "build/tray.png",
+      "lib/**/*"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "AI-Anime-Music-${version}-Setup-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AI Anime Music",
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": [
+        "ru_RU"
+      ],
+      "language": "1049"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "ZolotarevNikolay",
+        "repo": "AI-Anime-Music",
+        "releaseType": "draft"
+      }
+    ]
+  }
+}
