@@ -115,37 +115,28 @@ npm run dist
 ## Публикация релиза
 
 Репозиторий: <https://github.com/ZolotarevNikolay/AI-Anime-Music>.
+Релиз `v1.0.0` уже опубликован.
 
-Если GitHub CLI ещё не авторизован:
-
-```bash
-gh auth login
-```
-
-Первый релиз:
-
-```bash
-git init
-git add .
-git commit -m "AI Anime Music 1.0.0"
-gh repo create AI-Anime-Music --public --source=. --remote=origin --push
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-Тег `v*` запускает GitHub Actions: workflow собирает установщик и создаёт
-**черновик** релиза с `.exe`, `latest.yml` и `.blockmap`. Черновик нужно открыть
-на GitHub и нажать **Publish release** — после этого автообновление увидит версию.
-
-Следующий выпуск:
+Для следующего выпуска:
 
 ```bash
 npm version patch
+npm run dist
 git push --follow-tags
+gh release create v1.0.1 \
+  dist/AI-Anime-Music-1.0.1-Setup-x64.exe \
+  dist/AI-Anime-Music-1.0.1-Setup-x64.exe.blockmap \
+  dist/latest.yml \
+  --title "AI Anime Music 1.0.1" \
+  --notes "Что изменилось..."
 ```
 
 Важно: версия в `package.json` должна совпадать с тегом без буквы `v`
-(например, `1.0.1` и `v1.0.1`).
+(например, `1.0.1` и `v1.0.1`). Релиз должен быть опубликован, а не оставлен
+черновиком: только тогда автообновление увидит новую версию. Файлы `.exe`,
+`.blockmap` и `latest.yml` обязательны — без них обновление не сработает.
+
+Если GitHub CLI ещё не авторизован, выполните `gh auth login`.
 
 ## Управление
 
@@ -184,8 +175,6 @@ music-player/
 ├── build/
 │   ├── icon.ico             Иконка приложения и установщика
 │   └── tray.png             Иконка трея
-├── .github/workflows/
-│   └── release.yml          Сборка и черновик релиза по тегу v*
 └── icon.png
 ```
 
