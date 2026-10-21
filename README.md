@@ -106,7 +106,7 @@ npm run icons
 npm run dist
 ```
 
-Готовый файл появится в `dist/AI-Anime-Music-1.0.0-Setup-x64.exe`. Рядом будут
+Готовый файл появится в `dist/AI-Anime-Music-<версия>-Setup-x64.exe`. Рядом будут
 `latest.yml` и `.blockmap` — они нужны автообновлению.
 
 Установщик пока не подписан сертификатом, поэтому SmartScreen может показать предупреждение.
@@ -115,7 +115,7 @@ npm run dist
 ## Публикация релиза
 
 Репозиторий: <https://github.com/ZolotarevNikolay/AI-Anime-Music>.
-Релиз `v1.0.0` уже опубликован.
+Готовые релизы: <https://github.com/ZolotarevNikolay/AI-Anime-Music/releases>.
 
 Для следующего выпуска:
 
@@ -123,11 +123,12 @@ npm run dist
 npm version patch
 npm run dist
 git push --follow-tags
-gh release create v1.0.1 \
-  dist/AI-Anime-Music-1.0.1-Setup-x64.exe \
-  dist/AI-Anime-Music-1.0.1-Setup-x64.exe.blockmap \
+VERSION=$(node -p "require('./package.json').version")
+gh release create "v$VERSION" \
+  "dist/AI-Anime-Music-$VERSION-Setup-x64.exe" \
+  "dist/AI-Anime-Music-$VERSION-Setup-x64.exe.blockmap" \
   dist/latest.yml \
-  --title "AI Anime Music 1.0.1" \
+  --title "AI Anime Music $VERSION" \
   --notes "Что изменилось..."
 ```
 
